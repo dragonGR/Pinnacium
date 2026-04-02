@@ -1,77 +1,196 @@
 # Pinnacium
 
-It is a microbenchmarking framework for C++ aimed at providing precise performance measurements and analysis. It integrates hardware performance counters for detailed metrics and supports CSV exporting for comprehensive result analysis.
+Pinnacium is a lightweight C++ microbenchmarking library for measuring small pieces of code with repeated runs, warmup passes, optional setup and teardown hooks, and an optional x86 `rdpmc` path for low-level counter sampling.
 
-## Features
+This repository appears to be an early single-library experiment rather than a fully productized benchmarking suite. The current codebase exposes two runners:
 
-- **High-Resolution Timing:** Accurate measurement of code execution time using `std::chrono`.
-- **Hardware Performance Counters:** Access low-level CPU metrics (e.g., cache misses, branch mispredictions) via `rdpmc` instruction (x86 specific).
-- **Multi-Threading Support:** Run benchmarks in parallel to evaluate performance under concurrent conditions.
-- **Custom Setup/Teardown:** Define setup and teardown functions to prepare and clean up before and after each benchmark iteration.
-- **CSV Exporting:** Export benchmark results to a CSV file for easy analysis and visualization.
+- `Benchmark` for single-threaded measurements.
+- `MultiThreadedBenchmark` for running the same workload concurrently across a fixed number of worker threads.
 
-### Prerequisites
+The project now reports results to standard output only. CSV export has been removed so the library stays focused on measurement rather than result persistence.
 
-- A C++17 or later compiler.
-- For hardware performance counters, x86 architecture with appropriate permissions.
+## Current Status
 
-### Installation
+The repository had only one historical commit and minimal documentation, so this README is based on the implementation that is present today in [benchmark.h](benchmark.h) and [benchmark.cpp](benchmark.cpp).
 
-Clone the repository:
+Today, Pinnacium is best understood as:
+
+- A small embeddable benchmarking helper for local experiments.
+- A starting point for latency-oriented measurements in nanoseconds.
+- An x86-first utility with optional direct performance-counter sampling.
+
+It is not yet:
+
+- A statistically rigorous replacement for Google Benchmark or Criterion.
+- A reporting pipeline with file export, charting, or historical storage.
+- A cross-platform abstraction over hardware counters.
+
+## What The Library Does
+
+### `Benchmark`
+
+`Benchmark` runs a callable repeatedly on the current thread and records one duration sample per measured iteration.
+
+It supports:
+
+- Warmup iterations to reduce one-time startup noise.
+- Optional setup and teardown callables around each run.
+- Optional x86/x86_64 performance-counter reads through `rdpmc`.
+- Console summaries for mean, standard deviation, minimum, and maximum latency.
+
+### `MultiThreadedBenchmark`
+
+`MultiThreadedBenchmark` launches a fixed-size thread group for each measured iteration and records one duration sample per worker execution.
+
+That means:
+
+- `iterations = 100` and `threads = 8` produce up to `800` latency samples.
+- Reported statistics are aggregated across all collected thread samples.
+- This is useful for rough concurrency experiments, but it does not model coordinated start barriers, affinity pinning, or scheduler isolation.
+
+## Language And Compiler Support
+
+Pinnacium now targets **C++23**, which is the latest published C++ language standard. The build configuration in [CMakeLists.txt](CMakeLists.txt) requires `cxx_std_23`.
+
+Practical compiler guidance:
+
+- Use a current GCC, Clang, or MSVC release with strong C++23 support.
+- On this machine, the library was checked with `g++ 15.2.1` and `clang++ 22.1.0`.
+- For broader compiler feature tracking, see cppreference's compiler support tables: https://en.cppreference.com/w/cpp/compiler_support/
+
+## Platform Notes
+
+The timing path is portable C++, but the performance-counter path is not.
+
+- `enablePerformanceCounters(true)` is only meaningful on `x86` and `x86_64`.
+- The library uses the `rdpmc` instruction directly.
+- Even on supported CPUs, counter access depends on OS and kernel configuration.
+- If performance counters are requested on an unsupported build target, Pinnacium leaves them disabled and prints a warning to `stderr`.
+
+## Repository Layout
+
+- [benchmark.h](benchmark.h): public API declarations.
+- [benchmark.cpp](benchmark.cpp): benchmark runner implementation.
+- [examples/basic_benchmark.cpp](examples/basic_benchmark.cpp): small end-to-end usage example.
+- [CMakeLists.txt](CMakeLists.txt): modern CMake build entrypoint targeting C++23.
+
+## Building
+
+### With CMake
 
 ```bash
-git clone https://github.com/yourusername/OptimusBenchmark.git
-cd OptimusBenchmark
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
-## Usage
-- Define Your benchmark function:
+This produces:
+
+- `pinnacium`: the library target.
+- `pinnacium_basic`: a small example executable.
+
+### With A Direct Compiler Invocation
+
+```bash
+g++ -std=c++23 -O3 -pthread benchmark.cpp examples/basic_benchmark.cpp -I. -o pinnacium_basic
+```
+
+## Usage Example
+
 ```cpp
-void Function() {
-    volatile int sum = 0;
-    for (int i = 0; i < 1000; ++i) {
-        sum += i;
-    }
-}
-```
-
-- Create and Run a benchmark:
-```c
 #include "benchmark.h"
 
-int main() {
-    Benchmark bench("Benchmark", Function);
-    bench.enablePerformanceCounters(false); // Optional
-    bench.run();
+#include <vector>
 
-    return 0;
+int main() {
+    std::vector<int> values(10'000, 7);
+
+    Benchmark benchmark(
+        "sum_vector",
+        [&values] {
+            volatile long long sum = 0;
+            for (int value : values) {
+                sum += value;
+            }
+        },
+        250,
+        25);
+
+    benchmark.run();
 }
 ```
 
-- Run the Program:
+### Setup And Teardown Hooks
+
+```cpp
+Benchmark benchmark("prepare_and_run", [] {
+    // workload
+});
+
+benchmark.setSetupFunction([] {
+    // per-iteration preparation
+});
+
+benchmark.setTeardownFunction([] {
+    // per-iteration cleanup
+});
+
+benchmark.run();
 ```
-g++ -std=c++17 -o benchmark main.cpp
-./benchmark
+
+### Multi-Threaded Run
+
+```cpp
+MultiThreadedBenchmark benchmark(
+    "parallel_work",
+    [] {
+        volatile int value = 0;
+        for (int i = 0; i < 10'000; ++i) {
+            value += i;
+        }
+    },
+    100,
+    10,
+    8);
+
+benchmark.run();
 ```
 
 ## Example Output
-The benchmark will output results to the console and export data to a CSV file named _results.csv:
-```
-Benchmark: Benchmark
-Iterations: 100
-Mean: 12345678 ns
-Stddev: 1234 ns
-Min: 12300000 ns
-Max: 12400000 ns
-Performance Counters:
-Counter Value: 987654
+
+```text
+Benchmark: sum_vector
+Iterations: 250
+Samples: 250
+Mean: 3168 ns
+Stddev: 147 ns
+Min: 3014 ns
+Max: 3671 ns
 =========================
-Results exported to results.csv
 ```
 
-## Notes
-- Ensure you have the required permissions to access performance counters on your system.
-- Modify the benchmark functions and parameters as needed to fit your specific use cases.
+For `MultiThreadedBenchmark`, the output additionally includes the configured thread count and the total number of collected samples.
+
+## Design Trade-Offs
+
+This code intentionally stays compact, but that simplicity comes with trade-offs:
+
+- Timing uses wall-clock measurement around the full callable body.
+- There is no dead-code-elimination guard beyond what the benchmarked code itself does.
+- There is no percentile reporting, no outlier filtering, and no confidence interval estimation.
+- Multi-threaded runs do not synchronize worker start times beyond normal thread launch behavior.
+
+If you need publication-quality benchmarking or advanced statistical analysis, you should likely migrate the workload to a more mature framework.
+
+## Recent Cleanup In This Refresh
+
+The project has been refreshed to make the repository easier to understand and reuse:
+
+- Removed CSV export from the public behavior and implementation.
+- Raised the baseline language target to C++23.
+- Added a CMake build file and a runnable example.
+- Tightened the implementation for repeated runs and safer multi-threaded sample collection.
+- Rewrote the documentation around the actual current code instead of the stale historical description.
 
 ## License
-This project is licensed under the MIT License.
+
+No standalone license file is currently checked into this repository. If you plan to publish or distribute Pinnacium, add an explicit license before doing so.

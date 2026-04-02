@@ -1,13 +1,44 @@
 #include "benchmark.h"
 
+namespace {
+
+auto clampNonNegative(int value) -> int {
+    return std::max(value, 0);
+}
+
+#if defined(__i386__) || defined(__x86_64__)
+auto readPerfCounter() -> std::uint64_t {
+    unsigned int low = 0;
+    unsigned int high = 0;
+    __asm__ volatile(
+        "rdpmc\n\t"
+        "mov %%eax, %0\n\t"
+        "mov %%edx, %1\n\t"
+        : "=r"(low), "=r"(high)
+        :
+        : "%eax", "%edx");
+    return (static_cast<std::uint64_t>(high) << 32U) | low;
+}
+
+auto perfCounterBaseline() -> std::uint64_t& {
+    static thread_local std::uint64_t previousCounter = 0;
+    return previousCounter;
+}
+#endif
+
+} // namespace
+
 Benchmark::Benchmark(std::string name, BenchmarkFunction fn, int iterations, int warmup)
-    : name_(std::move(name)), function_(std::move(fn)), iterations_(iterations), warmup_(warmup) {}
+    : name_(std::move(name)),
+      function_(std::move(fn)),
+      iterations_(clampNonNegative(iterations)),
+      warmup_(clampNonNegative(warmup)) {}
 
 void Benchmark::run() {
+    resetMeasurements();
     warmUp();
     measure();
     printResults();
-    exportResults();
 }
 
 void Benchmark::setSetupFunction(BenchmarkFunction setup) {
@@ -19,7 +50,18 @@ void Benchmark::setTeardownFunction(BenchmarkFunction teardown) {
 }
 
 void Benchmark::enablePerformanceCounters(bool enable) {
-    usePerformanceCounters_ = enable;
+    usePerformanceCounters_ = enable && supportsPerformanceCounters();
+    if (enable && !usePerformanceCounters_) {
+        std::cerr << "Performance counters are only available on x86/x86_64 builds." << std::endl;
+    }
+}
+
+void Benchmark::resetMeasurements() {
+    const auto sampleCount = static_cast<size_t>(iterations_);
+    results_.clear();
+    performanceCounters_.clear();
+    results_.reserve(sampleCount);
+    performanceCounters_.reserve(sampleCount);
 }
 
 void Benchmark::warmUp() {
@@ -34,7 +76,7 @@ void Benchmark::measure() {
     for (int i = 0; i < iterations_; ++i) {
         if (setupFunction_) setupFunction_();
 
-        auto start = std::chrono::high_resolution_clock::now();
+        const auto start = std::chrono::high_resolution_clock::now();
         if (usePerformanceCounters_) {
             startPerfCounters();
         }
@@ -42,27 +84,33 @@ void Benchmark::measure() {
         if (usePerformanceCounters_) {
             stopPerfCounters();
         }
-        auto end = std::chrono::high_resolution_clock::now();
+        const auto end = std::chrono::high_resolution_clock::now();
 
         if (teardownFunction_) teardownFunction_();
 
-        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         results_.push_back(duration);
     }
 }
 
 void Benchmark::printResults() {
-    auto mean = std::accumulate(results_.begin(), results_.end(), 0LL) / results_.size();
-    auto variance = std::accumulate(results_.begin(), results_.end(), 0LL,
+    if (results_.empty()) {
+        std::cout << "Benchmark: " << name_ << '\n'
+                  << "No measurements were collected." << std::endl;
+        return;
+    }
+
+    const auto mean = std::accumulate(results_.begin(), results_.end(), 0LL) / static_cast<long long>(results_.size());
+    const auto variance = std::accumulate(results_.begin(), results_.end(), 0LL,
         [mean](long long sum, long long value) {
             return sum + (value - mean) * (value - mean);
-        }
-    ) / results_.size();
+        }) / static_cast<long long>(results_.size());
 
-    auto stddev = std::sqrt(variance);
+    const auto stddev = std::sqrt(static_cast<double>(variance));
 
     std::cout << "Benchmark: " << name_ << std::endl;
     std::cout << "Iterations: " << iterations_ << std::endl;
+    std::cout << "Samples: " << results_.size() << std::endl;
     std::cout << "Mean: " << mean << " ns" << std::endl;
     std::cout << "Stddev: " << stddev << " ns" << std::endl;
     std::cout << "Min: " << *std::min_element(results_.begin(), results_.end()) << " ns" << std::endl;
@@ -78,51 +126,44 @@ void Benchmark::printResults() {
     std::cout << "=========================" << std::endl;
 }
 
-void Benchmark::exportResults() {
-    std::ofstream file(name_ + "_results.csv");
-    file << "Iteration,Duration (ns)";
-    if (usePerformanceCounters_) {
-        file << ",Performance Counter";
-    }
-    file << "\n";
-    for (size_t i = 0; i < results_.size(); ++i) {
-        file << i + 1 << "," << results_[i];
-        if (usePerformanceCounters_ && i < performanceCounters_.size()) {
-            file << "," << performanceCounters_[i];
-        }
-        file << "\n";
-    }
-    file.close();
-    std::cout << "Results exported to " << name_ << "_results.csv" << std::endl;
-}
-
 void Benchmark::startPerfCounters() {
-    unsigned int low, high;
-    __asm__ volatile (
-        "rdpmc\n\t"
-        "mov %%eax, %0\n\t"
-        "mov %%edx, %1\n\t"
-        : "=r" (low), "=r" (high)
-        :
-        : "%eax", "%edx"
-    );
-    prevCounter_ = ((uint64_t)high << 32) | low;
+#if defined(__i386__) || defined(__x86_64__)
+    perfCounterBaseline() = readPerfCounter();
+#endif
 }
 
 void Benchmark::stopPerfCounters() {
-    uint64_t currentCounter;
-    __asm__ volatile ("rdpmc" : "=A" (currentCounter) : : "memory");
-    performanceCounters_.push_back(currentCounter - prevCounter_);
+#if defined(__i386__) || defined(__x86_64__)
+    const auto currentCounter = readPerfCounter();
+    performanceCounters_.push_back(currentCounter - perfCounterBaseline());
+#endif
 }
 
-MultiThreadedBenchmark::MultiThreadedBenchmark(std::string name, Benchmark::BenchmarkFunction fn, int iterations, int warmup, int threads)
-    : name_(std::move(name)), function_(std::move(fn)), iterations_(iterations), warmup_(warmup), threads_(threads) {}
+bool Benchmark::supportsPerformanceCounters() {
+#if defined(__i386__) || defined(__x86_64__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+MultiThreadedBenchmark::MultiThreadedBenchmark(
+    std::string name,
+    Benchmark::BenchmarkFunction fn,
+    int iterations,
+    int warmup,
+    int threads)
+    : name_(std::move(name)),
+      function_(std::move(fn)),
+      iterations_(clampNonNegative(iterations)),
+      warmup_(clampNonNegative(warmup)),
+      threads_(threads > 0 ? threads : 1) {}
 
 void MultiThreadedBenchmark::run() {
+    resetMeasurements();
     warmUp();
     measure();
     printResults();
-    exportResults();
 }
 
 void MultiThreadedBenchmark::setSetupFunction(Benchmark::BenchmarkFunction setup) {
@@ -134,7 +175,18 @@ void MultiThreadedBenchmark::setTeardownFunction(Benchmark::BenchmarkFunction te
 }
 
 void MultiThreadedBenchmark::enablePerformanceCounters(bool enable) {
-    usePerformanceCounters_ = enable;
+    usePerformanceCounters_ = enable && supportsPerformanceCounters();
+    if (enable && !usePerformanceCounters_) {
+        std::cerr << "Performance counters are only available on x86/x86_64 builds." << std::endl;
+    }
+}
+
+void MultiThreadedBenchmark::resetMeasurements() {
+    const auto sampleCount = static_cast<size_t>(iterations_) * static_cast<size_t>(threads_);
+    results_.clear();
+    performanceCounters_.clear();
+    results_.reserve(sampleCount);
+    performanceCounters_.reserve(sampleCount);
 }
 
 void MultiThreadedBenchmark::warmUp() {
@@ -149,10 +201,10 @@ void MultiThreadedBenchmark::warmUp() {
 
 void MultiThreadedBenchmark::measure() {
     for (int i = 0; i < iterations_; ++i) {
-        runInThreads([this, i] {
+        runInThreads([this] {
             if (setupFunction_) setupFunction_();
 
-            auto start = std::chrono::high_resolution_clock::now();
+            const auto start = std::chrono::high_resolution_clock::now();
             if (usePerformanceCounters_) {
                 startPerfCounters();
             }
@@ -160,41 +212,48 @@ void MultiThreadedBenchmark::measure() {
             if (usePerformanceCounters_) {
                 stopPerfCounters();
             }
-            auto end = std::chrono::high_resolution_clock::now();
+            const auto end = std::chrono::high_resolution_clock::now();
 
             if (teardownFunction_) teardownFunction_();
 
-            auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                results_.push_back(duration);
-            }
+            const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+            std::lock_guard<std::mutex> lock(mutex_);
+            results_.push_back(duration);
         });
     }
 }
 
 void MultiThreadedBenchmark::runInThreads(const std::function<void()>& task) {
     std::vector<std::thread> threadPool;
+    threadPool.reserve(static_cast<size_t>(threads_));
+
     for (int t = 0; t < threads_; ++t) {
         threadPool.emplace_back(task);
     }
-    for (auto& th : threadPool) {
-        th.join();
+    for (auto& thread : threadPool) {
+        thread.join();
     }
 }
 
 void MultiThreadedBenchmark::printResults() {
-    auto mean = std::accumulate(results_.begin(), results_.end(), 0LL) / results_.size();
-    auto variance = std::accumulate(results_.begin(), results_.end(), 0LL,
+    if (results_.empty()) {
+        std::cout << "Benchmark: " << name_ << '\n'
+                  << "No measurements were collected." << std::endl;
+        return;
+    }
+
+    const auto mean = std::accumulate(results_.begin(), results_.end(), 0LL) / static_cast<long long>(results_.size());
+    const auto variance = std::accumulate(results_.begin(), results_.end(), 0LL,
         [mean](long long sum, long long value) {
             return sum + (value - mean) * (value - mean);
-        }
-    ) / results_.size();
+        }) / static_cast<long long>(results_.size());
 
-    auto stddev = std::sqrt(variance);
+    const auto stddev = std::sqrt(static_cast<double>(variance));
 
     std::cout << "Benchmark: " << name_ << std::endl;
     std::cout << "Iterations: " << iterations_ << std::endl;
+    std::cout << "Threads: " << threads_ << std::endl;
+    std::cout << "Samples: " << results_.size() << std::endl;
     std::cout << "Mean: " << mean << " ns" << std::endl;
     std::cout << "Stddev: " << stddev << " ns" << std::endl;
     std::cout << "Min: " << *std::min_element(results_.begin(), results_.end()) << " ns" << std::endl;
@@ -210,30 +269,24 @@ void MultiThreadedBenchmark::printResults() {
     std::cout << "=========================" << std::endl;
 }
 
-void MultiThreadedBenchmark::exportResults() {
-    std::ofstream file(name_ + "_results.csv");
-    file << "Iteration,Duration (ns)";
-    if (usePerformanceCounters_) {
-        file << ",Performance Counter";
-    }
-    file << "\n";
-    for (size_t i = 0; i < results_.size(); ++i) {
-        file << i + 1 << "," << results_[i];
-        if (usePerformanceCounters_ && i < performanceCounters_.size()) {
-            file << "," << performanceCounters_[i];
-        }
-        file << "\n";
-    }
-    file.close();
-    std::cout << "Results exported to " << name_ << "_results.csv" << std::endl;
-}
-
 void MultiThreadedBenchmark::startPerfCounters() {
-    __asm__ volatile ("rdpmc" : "=A" (prevCounter_) : : "memory");
+#if defined(__i386__) || defined(__x86_64__)
+    perfCounterBaseline() = readPerfCounter();
+#endif
 }
 
 void MultiThreadedBenchmark::stopPerfCounters() {
-    uint64_t currentCounter;
-    __asm__ volatile ("rdpmc" : "=A" (currentCounter) : : "memory");
-    performanceCounters_.push_back(currentCounter - prevCounter_);
+#if defined(__i386__) || defined(__x86_64__)
+    const auto currentCounter = readPerfCounter();
+    std::lock_guard<std::mutex> lock(mutex_);
+    performanceCounters_.push_back(currentCounter - perfCounterBaseline());
+#endif
+}
+
+bool MultiThreadedBenchmark::supportsPerformanceCounters() {
+#if defined(__i386__) || defined(__x86_64__)
+    return true;
+#else
+    return false;
+#endif
 }

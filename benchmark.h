@@ -1,19 +1,25 @@
 #ifndef BENCHMARK_H
 #define BENCHMARK_H
 
-#include <iostream>
 #include <chrono>
-#include <vector>
-#include <string>
-#include <functional>
 #include <algorithm>
-#include <numeric>
-#include <thread>
-#include <mutex>
-#include <fstream>
 #include <cmath>
-#include <immintrin.h> // For RDPMC (x86-specific)
+#include <cstdint>
+#include <functional>
+#include <iostream>
+#include <mutex>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <vector>
 
+#if defined(__i386__) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+// Benchmark measures a callable repeatedly and reports latency statistics.
+// It is intended for quick microbenchmark experiments where a lightweight
+// single-header-style API is more important than framework integration.
 class Benchmark {
 public:
     using BenchmarkFunction = std::function<void()>;
@@ -26,13 +32,14 @@ public:
     void enablePerformanceCounters(bool enable);
 
 private:
+    void resetMeasurements();
     void warmUp();
     void measure();
     void printResults();
-    void exportResults();
 
     void startPerfCounters();
     void stopPerfCounters();
+    static bool supportsPerformanceCounters();
 
     std::string name_;
     BenchmarkFunction function_;
@@ -41,11 +48,12 @@ private:
     int iterations_;
     int warmup_;
     bool usePerformanceCounters_ = false;
-    uint64_t prevCounter_ = 0;
     std::vector<long long> results_;
     std::vector<uint64_t> performanceCounters_;
 };
 
+// MultiThreadedBenchmark executes the benchmark body concurrently across a
+// fixed number of worker threads and aggregates all observed samples.
 class MultiThreadedBenchmark {
 public:
     MultiThreadedBenchmark(std::string name, Benchmark::BenchmarkFunction fn, int iterations = 100, int warmup = 10, int threads = std::thread::hardware_concurrency());
@@ -56,14 +64,15 @@ public:
     void enablePerformanceCounters(bool enable);
 
 private:
+    void resetMeasurements();
     void warmUp();
     void measure();
     void runInThreads(const std::function<void()>& task);
     void printResults();
-    void exportResults();
 
     void startPerfCounters();
     void stopPerfCounters();
+    static bool supportsPerformanceCounters();
 
     std::string name_;
     Benchmark::BenchmarkFunction function_;
@@ -73,7 +82,6 @@ private:
     int warmup_;
     int threads_;
     bool usePerformanceCounters_ = false;
-    uint64_t prevCounter_ = 0;
     std::vector<long long> results_;
     std::vector<uint64_t> performanceCounters_;
     std::mutex mutex_;
